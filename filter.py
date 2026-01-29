@@ -1,6 +1,4 @@
-"""
-AI Image Filter - Detects and sorts AI-generated images based on metadata
-"""
+
 
 import os
 import shutil
