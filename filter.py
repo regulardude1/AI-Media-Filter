@@ -1,7 +1,3 @@
-"""
-AI Image Filter - Detects and sorts AI-generated images based on metadata
-"""
-
 import os
 import shutil
 import struct
@@ -54,10 +50,28 @@ AI_SIGNATURES = [
     "vae:",
     "clip skip",
     
-    # DALL-E / OpenAI
+    # DALL-E / OpenAI / ChatGPT
     "dall-e",
     "dalle",
+    "dall-e-3",
+    "dalle-3",
     "openai",
+    "chatgpt",
+    "gpt-4",
+    "c2pa",
+    "contentcredentials",
+    "made with ai",
+    
+    # Google Gemini / Imagen
+    "gemini",
+    "google gemini",
+    "imagen",
+    "google imagen",
+    "google ai",
+    "made by google",
+    "iptc.org/ai",
+    "digitalsourcetype",
+    "trainedmachine",
     
     # Midjourney
     "midjourney",
@@ -117,6 +131,36 @@ AI_SIGNATURES = [
 # File extensions to process
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.tiff', '.tif'}
 
+# Common AI-generated image dimensions (width, height)
+# These are used as additional heuristics when no metadata is found
+AI_IMAGE_DIMENSIONS = {
+    # DALL-E 3 / ChatGPT standard sizes
+    (1024, 1024),  # Square
+    (1024, 1792),  # Portrait
+    (1792, 1024),  # Landscape
+    # DALL-E 2 sizes
+    (512, 512),
+    (256, 256),
+    # Midjourney common sizes
+    (1456, 816),  # 16:9 upscaled
+    (816, 1456),  # 9:16 upscaled
+    (1024, 576),  # 16:9
+    (576, 1024),  # 9:16
+    # Gemini / ChatGPT additional aspect ratios
+    (1024, 768),  # 4:3
+    (768, 1024),  # 3:4
+    (1024, 682),  # 3:2 (common ChatGPT landscape)
+    (682, 1024),  # 2:3
+    (1024, 683),  # 3:2 variant
+    (683, 1024),  # 2:3 variant
+    # More common AI resolutions
+    (1280, 720),  # HD 16:9
+    (720, 1280),  # HD 9:16
+    (1536, 1024), # 3:2 larger
+    (1024, 1536), # 2:3 larger
+    (2048, 2048), # Large square (upscaled)
+}
+
 
 @dataclass
 class ScanResult:
@@ -126,6 +170,7 @@ class ScanResult:
     confidence: str  # "high", "medium", "low", "none"
     detected_signatures: list
     metadata_source: str  # Where the signature was found
+    ai_tool: str  # Identified AI tool: "ChatGPT", "Gemini", "Stable Diffusion", "Midjourney", etc.
 
 
 def read_png_chunks(filepath: Path) -> dict:
@@ -250,6 +295,191 @@ def get_exif_data(filepath: Path) -> dict:
     return exif_data
 
 
+def check_gemini_watermark(filepath: Path) -> bool:
+    """
+    Check for Gemini's watermark (white 4-pointed star in bottom-right corner).
+    Returns True if watermark is likely detected.
+    """
+    if not PIL_AVAILABLE:
+        return False
+    
+    try:
+        with Image.open(filepath) as img:
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            width, height = img.size
+            
+            # Check bottom-right corner (where Gemini puts its watermark)
+            # Watermark is typically in the bottom 5% and right 5% of image
+            corner_size = min(int(width * 0.08), int(height * 0.08), 80)
+            
+            # Crop bottom-right corner
+            corner = img.crop((
+                width - corner_size,
+                height - corner_size,
+                width,
+                height
+            ))
+            
+            # Look for bright white pixels in a pattern (the star is white)
+            # Count very bright pixels (potential watermark)
+            pixels = list(corner.getdata())
+            white_count = 0
+            near_white_count = 0
+            
+            for r, g, b in pixels:
+                # Check for white/near-white pixels
+                if r > 240 and g > 240 and b > 240:
+                    white_count += 1
+                elif r > 200 and g > 200 and b > 200:
+                    near_white_count += 1
+            
+            total_pixels = len(pixels)
+            white_ratio = white_count / total_pixels if total_pixels > 0 else 0
+            
+            # Gemini watermark typically has a specific pattern
+            # Not too many white pixels (it's subtle) but enough to be noticeable
+            # The star shape creates a specific white pixel density
+            if 0.02 < white_ratio < 0.25 and white_count > 20:
+                return True
+                
+    except Exception:
+        pass
+    
+    return False
+
+
+def check_ai_dimensions(filepath: Path) -> tuple:
+    """
+    Check if image has common AI-generated dimensions.
+    Returns (is_ai_dimension, width, height)
+    """
+    if not PIL_AVAILABLE:
+        return (False, 0, 0)
+    
+    try:
+        with Image.open(filepath) as img:
+            size = img.size
+            is_ai_dim = size in AI_IMAGE_DIMENSIONS
+            return (is_ai_dim, size[0], size[1])
+    except Exception:
+        return (False, 0, 0)
+
+
+def identify_ai_tool(detected_signatures: list, all_text: str) -> str:
+    """
+    Identify the specific AI tool based on detected signatures
+    Returns the most likely AI tool that generated the image
+    """
+    all_text_lower = all_text.lower()
+    signatures_lower = [s.lower() for s in detected_signatures]
+    
+    # ChatGPT / DALL-E 3 indicators
+    chatgpt_indicators = [
+        'chatgpt', 'gpt-4', 'dall-e-3', 'dalle-3', 'c2pa', 
+        'contentcredentials', 'made with ai'
+    ]
+    if any(ind in all_text_lower for ind in chatgpt_indicators):
+        return "ChatGPT (DALL-E 3)"
+    
+    # Check for OpenAI/DALL-E (older versions or generic)
+    if any(ind in all_text_lower for ind in ['openai', 'dall-e', 'dalle']):
+        return "DALL-E (OpenAI)"
+    
+    # Google Gemini / Imagen indicators
+    gemini_indicators = [
+        'gemini', 'google gemini', 'imagen', 'google imagen', 
+        'google ai', 'made by google', 'iptc.org/ai', 
+        'digitalsourcetype', 'trainedmachine'
+    ]
+    if any(ind in all_text_lower for ind in gemini_indicators):
+        return "Google Gemini"
+    
+    # Midjourney indicators
+    midjourney_indicators = ['midjourney', '--ar ', '--v ', 'mj']
+    if any(ind in all_text_lower for ind in midjourney_indicators):
+        return "Midjourney"
+    
+    # ComfyUI indicators
+    if 'comfyui' in all_text_lower or 'comfy' in all_text_lower or 'workflow' in all_text_lower:
+        return "ComfyUI"
+    
+    # Automatic1111 / A1111 indicators
+    a1111_indicators = ['automatic1111', 'a1111', 'parameters']
+    if any(ind in all_text_lower for ind in a1111_indicators):
+        return "Stable Diffusion (A1111)"
+    
+    # NovelAI indicators
+    if 'novelai' in all_text_lower or 'nai diffusion' in all_text_lower:
+        return "NovelAI"
+    
+    # InvokeAI indicators
+    if 'invokeai' in all_text_lower:
+        return "InvokeAI"
+    
+    # Adobe Firefly indicators
+    if 'firefly' in all_text_lower or 'adobe' in all_text_lower:
+        return "Adobe Firefly"
+    
+    # Bing Image Creator / Copilot Designer
+    if 'bing image creator' in all_text_lower or 'copilot designer' in all_text_lower:
+        return "Bing Image Creator"
+    
+    # Leonardo.AI indicators
+    if 'leonardo' in all_text_lower:
+        return "Leonardo.AI"
+    
+    # Generic Stable Diffusion detection
+    sd_indicators = [
+        'stable diffusion', 'stablediffusion', 'sd_model', 'sdxl', 
+        'sd 1.5', 'sd 2.1', 'flux', 'cfg scale', 'cfg_scale',
+        'sampler:', 'steps:', 'seed:', 'negative prompt', 'lora:',
+        'checkpoint:', 'vae:', 'clip skip', 'txt2img', 'img2img',
+        'controlnet', 'lora', 'dreambooth'
+    ]
+    if any(ind in all_text_lower for ind in sd_indicators):
+        return "Stable Diffusion"
+    
+    # Check for known model names (SD-based)
+    model_names = [
+        'realistic vision', 'deliberate', 'counterfeit', 'anything v',
+        'dreamshaper', 'protogen', 'basil mix', 'abyss orange',
+        'majicmix', 'chilloutmix', 'meinamix'
+    ]
+    if any(name in all_text_lower for name in model_names):
+        return "Stable Diffusion"
+    
+    # Other known AI tools
+    if 'nightcafe' in all_text_lower:
+        return "NightCafe"
+    if 'artbreeder' in all_text_lower:
+        return "Artbreeder"
+    if 'deepai' in all_text_lower:
+        return "DeepAI"
+    if 'starryai' in all_text_lower:
+        return "StarryAI"
+    if 'craiyon' in all_text_lower:
+        return "Craiyon"
+    if 'wombo' in all_text_lower:
+        return "Wombo Dream"
+    if 'runway' in all_text_lower:
+        return "Runway"
+    if 'playground' in all_text_lower:
+        return "Playground AI"
+    if 'dreamlike' in all_text_lower:
+        return "Dreamlike"
+    if 'lexica' in all_text_lower:
+        return "Lexica"
+    
+    # Generic AI detection
+    if any(ind in all_text_lower for ind in ['ai generated', 'ai-generated', 'generated by ai', 'created with ai', 'text2image', 'text-to-image']):
+        return "Unknown AI Tool"
+    
+    return "Unknown AI Tool"
+
+
 def check_for_ai_signatures(metadata: dict, filepath: Path) -> ScanResult:
     """Check metadata for AI generation signatures"""
     detected = []
@@ -268,6 +498,19 @@ def check_for_ai_signatures(metadata: dict, filepath: Path) -> ScanResult:
                 sources.append(key)
     
     # Special checks for specific patterns
+    
+    # Check for C2PA / Content Credentials (ChatGPT/DALL-E 3)
+    if any(key.lower() in ['c2pa', 'contentcredentials', 'jumbf'] for key in metadata.keys()):
+        detected.append('c2pa content credentials')
+        sources.append('Content Credentials')
+    
+    # Check for IPTC DigitalSourceType (Gemini/Google AI)
+    for key, value in metadata.items():
+        if 'digitalsourcetype' in key.lower() or 'iptc' in key.lower():
+            if 'trainedmachine' in str(value).lower() or 'generative' in str(value).lower():
+                detected.append('iptc ai marker')
+                sources.append('IPTC metadata')
+                break
     
     # Check for "parameters" key (A1111/ComfyUI specific)
     if any(key.lower() in ['parameters', 'png:parameters', 'prompt'] for key in metadata.keys()):
@@ -300,12 +543,16 @@ def check_for_ai_signatures(metadata: dict, filepath: Path) -> ScanResult:
     
     is_ai = confidence != "none"
     
+    # Identify the AI tool
+    ai_tool = identify_ai_tool(unique_detected, all_text) if is_ai else "None"
+    
     return ScanResult(
         filepath=filepath,
         is_ai=is_ai,
         confidence=confidence,
         detected_signatures=unique_detected,
-        metadata_source=", ".join(set(sources)) if sources else "none"
+        metadata_source=", ".join(set(sources)) if sources else "none",
+        ai_tool=ai_tool
     )
 
 
@@ -323,7 +570,51 @@ def scan_image(filepath: Path) -> ScanResult:
     exif_data = get_exif_data(filepath)
     metadata.update(exif_data)
     
-    return check_for_ai_signatures(metadata, filepath)
+    # First check metadata-based detection
+    result = check_for_ai_signatures(metadata, filepath)
+    
+    # If no metadata signatures found, check for visual/heuristic markers
+    if not result.is_ai:
+        detected = []
+        sources = []
+        ai_tool = "None"
+        
+        # Check for Gemini watermark (white star in corner)
+        if check_gemini_watermark(filepath):
+            detected.append('gemini watermark detected')
+            sources.append('visual watermark')
+            ai_tool = "Google Gemini"
+        
+        # Check for AI-typical dimensions with no EXIF (suspicious for ChatGPT/DALL-E)
+        is_ai_dim, width, height = check_ai_dimensions(filepath)
+        
+        # Images with AI dimensions AND no EXIF are suspicious
+        # (Real camera photos almost always have EXIF)
+        has_no_exif = not exif_data or len([k for k in exif_data.keys() if not k.startswith('PNG:')]) == 0
+        
+        if is_ai_dim and has_no_exif:
+            detected.append(f'ai-typical dimensions ({width}x{height}) with no EXIF')
+            sources.append('dimension analysis')
+            
+            # 1024x1024 specifically is very common for DALL-E 3 / ChatGPT
+            if width == 1024 and height == 1024 and ai_tool == "None":
+                ai_tool = "ChatGPT (DALL-E 3) or Gemini"
+        
+        if detected:
+            # Build new result with visual detection
+            unique_detected = list(set(detected))
+            confidence = "medium" if len(unique_detected) >= 2 else "low"
+            
+            return ScanResult(
+                filepath=filepath,
+                is_ai=True,
+                confidence=confidence,
+                detected_signatures=unique_detected,
+                metadata_source=", ".join(set(sources)) if sources else "none",
+                ai_tool=ai_tool
+            )
+    
+    return result
 
 
 def scan_folder(source_folder: str, verbose: bool = True) -> list[ScanResult]:
@@ -429,6 +720,7 @@ def filter_ai_images(
         "errors": 0,
         "files_moved": [],
         "files_kept": [],
+        "by_tool": {},  # Track counts by AI tool
     }
     
     for i, filepath in enumerate(image_files, 1):
@@ -450,6 +742,12 @@ def filter_ai_images(
                 else:
                     stats["ai_low"] += 1
                 
+                # Track by AI tool
+                tool = result.ai_tool
+                if tool not in stats["by_tool"]:
+                    stats["by_tool"][tool] = 0
+                stats["by_tool"][tool] += 1
+                
                 # Determine destination path
                 dest_file = dest_path / filepath.name
                 
@@ -470,12 +768,13 @@ def filter_ai_images(
                     "original": str(filepath),
                     "destination": str(dest_file),
                     "confidence": result.confidence,
+                    "ai_tool": result.ai_tool,
                     "signatures": result.detected_signatures[:5]  # Limit for readability
                 })
                 
                 if verbose:
                     action = "Moved" if move else "Copied"
-                    print(f"    [{result.confidence.upper()}] {action}: {filepath.name}")
+                    print(f"    [{result.confidence.upper()}] [{result.ai_tool}] {action}: {filepath.name}")
                     
             else:
                 stats["normal"] += 1
@@ -498,6 +797,15 @@ def filter_ai_images(
         print(f"  - Low confidence: {stats['ai_low']}")
         print(f"Normal images: {stats['normal']}")
         print(f"Errors: {stats['errors']}")
+        
+        # Show breakdown by AI tool
+        if stats["by_tool"]:
+            print(f"\n{'='*60}")
+            print(f"BREAKDOWN BY AI TOOL")
+            print(f"{'='*60}")
+            for tool, count in sorted(stats["by_tool"].items(), key=lambda x: -x[1]):
+                print(f"  {tool}: {count}")
+        
         print(f"{'='*60}\n")
     
     return stats
