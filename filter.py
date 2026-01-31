@@ -1,3 +1,8 @@
+<<<<<<< HEAD
+=======
+
+
+>>>>>>> 7a373f22164f29c044dcae7aebd42813c5683d39
 import os
 import shutil
 import struct
